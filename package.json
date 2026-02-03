@@ -28,10 +28,10 @@
     "file-saver": "2.0.5",
     "jquery": "~3.6.3",
     "moment": "~2.29.4",
-    "web-ext": "^7.5.0"
+    "web-ext": "^9.2.0"
   },
   "devDependencies": {
-    "eslint": "^8.5.0",
+    "eslint": "^9.39.2",
     "jasmine": "^4.5.0",
     "karma": "^6.4.1",
     "karma-chrome-launcher": "^3.1.1",
@@ -40,7 +40,7 @@
     "karma-jasmine": "^5.1.0",
     "karma-jasmine-ajax": "^0.1.13",
     "karma-jquery": "^0.2.4",
-    "puppeteer": "^19.6.2",
+    "puppeteer": "^24.36.1",
     "vendor-copy": "^3.0.1",
     "whatwg-fetch": "^3.6.2"
   },
