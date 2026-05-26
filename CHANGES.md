@@ -12,9 +12,29 @@ Changes:
 
 Fixes:
  - None yet
-  
+
 For developers:
  - Nothing yet
+
+### 2.8.8 (2026-02-18)
+
+Fixes:
+ - Add support to upload PDFs from the new ACMS download modal to the RECAP Archive ([#401](https://github.com/freelawproject/recap/issues/401), [#423](https://github.com/freelawproject/recap-chrome/pull/423))
+ - Skip document links on the ACMS docket page that have no matching docket entry to prevent errors during metadata extraction ([#423](https://github.com/freelawproject/recap-chrome/pull/423))
+
+### 2.8.7 (2026-01-30)
+
+Features:
+ - Tweaks ACMS logic to support HTMX partial content updates and enhances metadata extraction ([#420](https://github.com/freelawproject/recap-chrome/pull/420))
+
+Changes:
+ - Namespace RECAP button CSS to avoid Bootstrap overrides
+ - Updates ACMS page observer to handle Firefox page load timing ([#422](https://github.com/freelawproject/recap-chrome/pull/422))
+
+### 2.8.6 (2025-12-09)
+
+Features:
+ - Adds annual tab popup asking for support from all users ([400](https://github.com/freelawproject/recap/issues/400), [418](https://github.com/freelawproject/recap-chrome/pull/418))
 
 ## 2.8.5 (2025-06-16)
 

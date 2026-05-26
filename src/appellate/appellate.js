@@ -1,3 +1,5 @@
+let acmsPageObserver = null;
+
 //  Abstraction of scripts related to Appellate PACER to make them modular and
 // testable.
 let AppellateDelegate = function (tabId, court, url, path, links) {
@@ -49,13 +51,52 @@ AppellateDelegate.prototype.regularAppellatePageHandler = function () {
 };
 
 AppellateDelegate.prototype.ACMSPageHandler = function () {
-  if (this.path.startsWith('/download-confirmation/')) {
-    this.handleAcmsDownloadPage();
-  } else if (this.path.startsWith('/documents-list/')) {
-    this.handleAcmsAttachmentPage();
-  } else if (this.path.match(/^\/[0-9\-]+$/)) {
+  // ACMS pages use HTMX for partial page updates, which means content loads
+  // asynchronously and replaces sections of the DOM without reloading the full
+  // page. Because of this, we use a MutationObserver to detect when specific
+  // ACMS components are injected into the DOM and trigger the appropriate
+  // handlers at the right time.
+  //
+  // The observer watches for additions to the DOM and runs the correct handler
+  // whenever a known ACMS page structure appears.
+  const pageObserver = async (mutationList, observer) => {
+    for (const r of mutationList) {
+      // We could restrict this to div#box, but that feels overspecific
+      for (const node of r.addedNodes) {
+        if (node.tagName !== 'DIV') continue;
+        if (node.id === 'indexContent' || node.id === 'fullDocketContent') {
+          this.handleAcmsDocket();
+        }
+        if (node.classList.contains('documents-list-wrapper')) {
+          this.handleAcmsAttachmentPage();
+        }
+        if (node.textContent.toLowerCase().includes('download confirmation')) {
+          this.handleAcmsDownloadPage();
+        }
+      }
+    }
+  };
+
+  // If ACMS has already rendered the main content container (indexContent),
+  // we can immediately initialize the docket handler without waiting for
+  // HTMX updates. This handles cases where the page loads fully before
+  // the extension runs or when navigating back/forward.
+  if (
+    document.getElementById('indexContent') ||
+    document.getElementById('fullDocketContent')
+  ) {
     this.handleAcmsDocket();
   }
+
+  if (acmsPageObserver) return;
+
+  // Always set up the observer to watch for HTMX updates, even if content
+  // is already present. HTMX can trigger partial page updates at any time,
+  // and we need to respond to those changes in both Chrome (node-by-node
+  // loading) and Firefox (full page already loaded).
+  const body = document.querySelector('body');
+  acmsPageObserver = new MutationObserver(pageObserver.bind(this));
+  acmsPageObserver.observe(body, { subtree: true, childList: true });
 };
 
 // Identify and handle pages from Appellate courts.
@@ -68,9 +109,41 @@ AppellateDelegate.prototype.dispatchPageHandler = function () {
 };
 
 AppellateDelegate.prototype.handleAcmsAttachmentPage = async function () {
-  const processAttachmentPage = async () => {
-    let caseSummary = JSON.parse(sessionStorage.caseSummary);
-    this.pacer_case_id = caseSummary.caseDetails.caseId;
+  const getDocketEntryId = async () => {
+    // Retrieves the docketEntryId associated with the currently
+    // displayed ACMS document viewer modal.
+    //
+    // This works by:
+    // 1. Reading the `docsToEntries` mapping stored in tab storage,
+    //    which maps document IDs to docket entry IDs.
+    // 2. Locating the document viewer modal.
+    // 3. Extracting the `data-doc-id` from the first `.entry-link`
+    //    element in the modal.
+    // 4. Returning the corresponding docketEntryId.
+    const tabStorage = await getItemsFromStorage(this.tabId);
+    const docsToEntries = tabStorage && tabStorage.docsToEntries;
+
+    const modal = document.getElementById('document-viewer-modal');
+    const links = modal.querySelectorAll('.entry-link');
+
+    return docsToEntries[links[0].dataset.docId];
+  };
+
+  const processAttachmentPage = async (entryId) => {
+    // Processes the ACMS attachment page by building a RECAP upload
+    // payload and sending it to the background for upload.
+    //
+    // Steps performed:
+    // 1. Reads the ACMS document view model from session storage.
+    // 2. Extracts the relevant case details and docket entry data.
+    // 3. Separates docket entry metadata from its documents to keep
+    //    the payload structure consistent with existing RECAP uploads.
+    // 4. Sends the attachment page data to the background for upload.
+    // 5. Displays a success or failure notification to the user.
+    let caseData = JSON.parse(sessionStorage.recapDocViewModel);
+    const { caseDetails, docketEntries } = caseData;
+    const docketDetails = caseDetails[0];
+    this.pacer_case_id = docketDetails.caseId;
 
     const options = await getItemsFromStorage('options');
     if (!options['recap_enabled']) {
@@ -79,11 +152,17 @@ AppellateDelegate.prototype.handleAcmsAttachmentPage = async function () {
       );
     }
 
-    let vueData = JSON.parse(sessionStorage.recapVueData);
+    const docketEntryData = docketEntries.find(
+      (entry) => entry.docketEntryId == entryId
+    );
+    // Remove documents from the docketEntry object and send them
+    // separately to avoid nesting document data twice.
+    const { docketEntryDocuments, ...docketEntry } = docketEntryData;
+
     let requestBody = {
-      caseDetails: caseSummary.caseDetails,
-      docketEntry: vueData.docketEntry,
-      docketEntryDocuments: vueData.docketEntryDocuments,
+      caseDetails: docketDetails,
+      docketEntry,
+      docketEntryDocuments,
     };
 
     const upload = await dispatchBackgroundFetch({
@@ -113,53 +192,37 @@ AppellateDelegate.prototype.handleAcmsAttachmentPage = async function () {
 
   };
 
-  const attachLinkToDocs = async () => {
+  const attachLinkToDocs = async (entryId) => {
     // This function attaches links to available RECAP documents for each entry
     // on the current page. It performs the following steps:
     //
     // 1. Retrieves docket entry and document data from session storage.
-    // 2. Selects all elements with the class "entry-link" on the page.
-    // 3. Loops through each link:
-    //    - Extracts the document number from the previous sibling element.
-    //    - Finds the corresponding document data object using the document
-    //      number.
-    //    - Embeds the document's `docketDocumentDetailsId` as a
-    //      `data-document-guid` attribute in the link.
-    // 4. Queries the server for the availability of these documents from RECAP.
-    // 5. Iterates through the response:
-    //    - Extracts the `acms_document_guid` for each available document.
-    //    - Finds the corresponding link element using the previously attached
-    //     `data-document-guid` attribute.
-    //    - Creates a link element
-    //    - Inserts the RECAP icon element next to the original entry link.
-    const attachmentsData = JSON.parse(sessionStorage.recapVueData);
-    const documentsData = attachmentsData.docketEntryDocuments;
+    // 2. Collects all document entry links within the document viewer modal.
+    // 3. Queries the RECAP backend to check which documents are available.
+    // 4. Matches available documents using the `data-doc-id` attribute.
+    // 5. Inserts a RECAP icon linking to the free document next to
+    //    each corresponding entry link.
+    let caseData = JSON.parse(sessionStorage.recapDocViewModel);
+    const { docketEntries } = caseData;
+    const docketEntryData = docketEntries.find(
+      (entry) => entry.docketEntryId == entryId
+    );
+
+    // Scope all DOM queries to the document viewer modal to avoid
+    // accidentally matching links elsewhere on the page.
+    const modal = document.getElementById('document-viewer-modal');
 
     // Get all the entry links on the page. We use the "entry-link"
     // class as a selector because all rows on the page
     // consistently use this class.
-    this.links = document.body.querySelectorAll('.entry-link');
-    if (!links.length) return;
+    this.links = modal.querySelectorAll('.entry-link');
+    if (!this.links.length) return;
 
-    // Go through the array of links and embed the document_guid
-    for (link of this.links) {
-      // The document number and the link are enclosed within the
-      // same span tag and are located adjacent to each other.
-      // Therefore, to retrieve the document number, we need to use
-      //  the previousSibling property.
-      let documentNumberText = link.previousSibling.innerHTML.trim();
-      const docData = documentsData.find(
-        (document) => document.documentNumber == documentNumberText
-      );
-
-      // Embed the document_guid as a data attribute within the anchor tag
-      // to facilitate subsequent retrieval based on this identifier.
-      link.dataset.documentGuid = docData.docketDocumentDetailsId;
-    }
-
-    let docIds = [attachmentsData.docketEntry.docketEntryId];
+    let docIds = [docketEntryData.docketEntryId];
     let clCourt = PACER.convertToCourtListenerCourt(this.court);
-    // Ask the server whether any of these documents are available from RECAP.
+
+    // Ask the server which documents for this docket entry
+    // are available from the RECAP Archive.
     const recapLinks = await dispatchBackgroundFetch({
       action: 'getAvailabilityForDocuments',
       data: {
@@ -169,12 +232,13 @@ AppellateDelegate.prototype.handleAcmsAttachmentPage = async function () {
     });
     for (result of recapLinks.results) {
       let doc_guid = result.acms_document_guid;
-      // Query the docket entry link using the data attribute
-      // attached previously
+      // Query the docket entry link using the
+      // `data-doc-id` attribute embedded by ACMS.
       let anchor = document.querySelector(
-        `[data-document-guid="${doc_guid}"]`
+        `[data-doc-id="${doc_guid}"]`
       );
-      // Create the RECAP icon
+
+      // Create the RECAP icon and link to the document.
       let href = `https://storage.courtlistener.com/${result.filepath_local}`;
       let recap_link = $('<a/>', {
         title: 'Available for free from the RECAP Archive.',
@@ -189,34 +253,40 @@ AppellateDelegate.prototype.handleAcmsAttachmentPage = async function () {
         class: 'recap-inline-appellate',
       });
       recap_div.append(recap_link);
-      // Insert the RECAP icon next to the docket entry link
+      // Insert the RECAP icon immediately after the
+      // corresponding ACMS document link.
       recap_div.insertAfter(anchor);
     }
   };
 
-  // This following logic monitors for specific DOM changes using
-  // MutationObserver. It iterates through mutations and checks for added nodes
-  // that meet two criteria:
-  //   1. The node's text content (lowercase) includes "documents are attached
-  //      to this filing".
-  //   2. The node's parent element is an h4 element.
-  // If both conditions are true, it triggers these actions:
-  //   - Stores relevant Vue data in session storage.
-  //   - Processes the current page as an attachment page.
-  //   - Attaches links to entries on the page.
   const wrapperMutationObserver = async (mutationList, observer) => {
+    // Observes the ACMS attachment page for DOM changes and detects
+    // when the attachments section becomes available.
+    //
+    // The observer looks for an H4 element containing the text
+    // "documents are attached to this filing". Once detected:
+    // 1. The active docketEntryId is resolved from the document modal.
+    // 2. The attachment page is processed and uploaded to RECAP.
+    // 3. RECAP availability icons are attached to document links.
+    // 4. The observer disconnects to prevent duplicate work.
     for (const r of mutationList) {
       for (const n of r.addedNodes) {
-        let isTitle = n.textContent
+        // Look for the H4 either on the node itself or inside it
+        let h4 = n.tagName === 'H4' ? n : n.querySelector('h4');
+        if (!h4) continue;
+
+        let isAttachmentsTitle = n.textContent
           .toLowerCase()
           .includes('documents are attached to this filing');
-        let isTargetingH4Div = n.parentElement.localName === 'h4';
-        if (isTitle && isTargetingH4Div) {
-          // Insert script to retrieve and store Vue data in the storage
-          await APPELLATE.storeVueDataInSession();
-          processAttachmentPage();
-          attachLinkToDocs();
-        }
+        if (!isAttachmentsTitle) continue;
+
+        let entryId = await getDocketEntryId();
+        processAttachmentPage(entryId);
+        attachLinkToDocs(entryId);
+
+        // Disconnect after the first successful match to avoid
+        // repeated uploads or duplicate icon insertion.
+        observer.disconnect();
       }
     }
   };
@@ -227,10 +297,32 @@ AppellateDelegate.prototype.handleAcmsAttachmentPage = async function () {
 };
 
 AppellateDelegate.prototype.handleAcmsDocket = async function () {
+  const getACMSCaseIdFromSession = async () => {
+    // Retrieves the pacer_case_id from the ACMS metadata stored in
+    // sessionStorage
+    let caseData = JSON.parse(sessionStorage.recapDocViewModel);
+    const { caseDetails } = caseData;
+    const docketDetails = caseDetails[0];
+    return docketDetails.caseId;
+  };
+
   const processDocket = async () => {
-    const caseSummary = JSON.parse(sessionStorage.caseSummary);
-    const caseId = caseSummary.caseDetails.caseId;
-    this.pacer_case_id = caseId;
+    // Uploads the ACMS docket JSON metadata to the RECAP archive.
+    //
+    // Steps performed:
+    //  1. Reads `recapDocViewModel` from sessionStorage, which contains both
+    //     caseDetails and docketInfo as provided by ACMS.
+    //  2. Extracts only the fields required for RECAP.
+    //  3. Skips upload if the page was already uploaded in this session
+    //  4. Respects user preferences by checking if RECAP uploads are disabled.
+    //  5. Sends the structured docket metadata to the background worker for
+    //     upload.
+    //  6. Displays a success notification if the upload completes without error
+    const caseData = JSON.parse(sessionStorage.recapDocViewModel);
+
+    // Only keep what we need
+    const { caseDetails, docketInfo } = caseData;
+    const docketDetails = caseDetails[0];
 
     if (history.state && history.state.uploaded) return;
 
@@ -246,7 +338,7 @@ AppellateDelegate.prototype.handleAcmsDocket = async function () {
         court: PACER.convertToCourtListenerCourt(this.court),
         pacer_case_id: this.pacer_case_id,
         upload_type: 'ACMS_DOCKET_JSON',
-        html: sessionStorage.caseSummary,
+        html: JSON.stringify({ caseDetails: docketDetails, docketInfo }),
       },
     });
     if (upload.error) return;
@@ -259,14 +351,17 @@ AppellateDelegate.prototype.handleAcmsDocket = async function () {
   };
 
   const insertRecapButton = async () => {
-    // Injects a "RECAP actions" button near the first table containing data.
-    // It first checks for an existing button with the ID "recap-action-button",
-    // If none exists, it creates a new button using the `recapActionsButton`
-    // function and inserts it before the table. The function then queries the
-    // RECAP service for case data availability using the `this.court` and
-    //`this.pacer_case_id` properties.
-
-    // Query the first table with case data and insert the RECAP actions button
+    // Inserts the "RECAP actions" button at the top of the docket view.
+    // This function performs the following steps:
+    //  1. Locates the primary case-information table rendered by ACMS.
+    //  2. Checks whether a RECAP action button is already present to
+    //     avoid duplicates.
+    //  3. If not present, creates a new RECAP actions button using
+    //     the `recapActionsButton` function.
+    //  4. Queries RECAP for docket availability information.
+    //  5. If a single docket record exists:
+    //     - Adds an alert button to the buttons dropdown menu.
+    //     - Adds a search-in-RECAP link using the CL docket ID.
     let caseInformationTable = document.querySelector('table.case-information');
     // Get a reference to the parent node
     const parentDiv = caseInformationTable.parentNode;
@@ -293,68 +388,61 @@ AppellateDelegate.prototype.handleAcmsDocket = async function () {
   };
 
   const attachLinkToDocs = async () => {
-    // This function analyzes docket entries on the docket report and adds RECAP
-    // RECAP availability information. It performs the following steps:
+    // Adds RECAP availability indicators to each docket entry link displayed
+    // in the ACMS docket view. It perform the following steps:
     //
     // 1. Data Retrieval:
-    //    - Fetches the case summary object from from session storage.
-    //    - Extracts the docket entries array from the case summary.
-    //    - Retrieves all anchor elements with the class "entry-link".
+    //    - Reads the full `recapDocViewModel` from sessionStorage.
+    //    - Extract the array of `docketEntries`, each containing documents.
+    //    - Query all `.entry-link` anchor tags rendered by ACMS.
     //
-    // 2. Processing Docket Entries:
-    //    - Iterates through the retrieved links:
-    //       - Extracts the docket entry number from the link text.
-    //       - Searches the docket entries array to find the corresponding
-    //         entry data (based on entry number).
-    //       - If a match is found, embeds the pacer_doc_id as a data attribute
-    //         within the anchor tag for later retrieval.
-    //       - Extracts the docket entry ID and adds it to an array of doc IDs.
+    // 2. Docket Entry Mapping:
+    //    - For each link, read its `data-docket-entry-id`.
+    //    - Look up the matching docketEntry in the `docketEntries` array.
+    //    - Collect all docketEntryIds to be checked for RECAP availability.
+    //    - Build a `docsToEntries` map that associates each ACMS document ID
+    //      (`docketDocumentDetailsId`) with its parent docketEntryId.
+    //      This mapping is later used by attachment pages and related workflows
     //
     // 3. RECAP Availability Check:
-    //    - Queries the server to check if any of the collected doc IDs are
-    //      available in the RECAP archive.
+    //    - Query RECAP via the background worker, requesting availability for
+    //      all collected docketEntryIds.
     //    - The court information is also included in the request.
     //
     // 4. Enriching Links with RECAP Information:
-    //    - Iterates through the response from CL:
-    //       - Extracts the pacer_doc_id from each response object.
-    //       - Finds the corresponding anchor element using the previously
-    //         attached data attribute.
-    //       - Creates a new anchor element with a link to the RECAP archive
-    //         based on the filepath provided in the response and Adds a RECAP
-    //         icon using the extension's image asset.
-    //       - Wraps both the icon and the link within a dedicated container div
-    //         with the class "recap-inline-appellate", this class ensures that
-    //         the icon is hidden when printing the document.
-    //       - Inserts the div container next to the original docket entry link.
+    //    For each available document:
+    //       - Finds the matching anchor via its data attribute.
+    //       - Creates a RECAP link pointing to the stored PDF.
+    //       - Wraps the icon and link in a `.recap-inline-appellate` div.
+    //       - Appends the div next to the docket entry’s link.
 
     // Get the docket info from the sessionStorage obj
-    const caseSummary = JSON.parse(sessionStorage.caseSummary);
-    const docketEntries = caseSummary.docketInfo.docketEntries;
+    const recapDocViewModel = JSON.parse(sessionStorage.recapDocViewModel);
+    const docketEntries = recapDocViewModel.docketEntries;
 
     // Get all the entry links on the page. We use the "entry-link"
     // class as a selector because we observed that all non-restricted
     // entries consistently use this class.
     this.links = document.body.querySelectorAll('.entry-link');
-    if (!links.length) return;
+    if (!this.links.length) return;
 
     // Go through the array of links and collect the doc IDs of
     // the entries that are not restricted.
     let docIds = [];
+    let docsToEntries = {};
     for (link of this.links) {
-      const docketEntryText = link.innerHTML.trim();
+      const docketEntryId = link.dataset.docketEntryId;
       const docketEntryData = docketEntries.find(
-        (entry) => entry.entryNumber == parseInt(docketEntryText)
+        (entry) => entry.docketEntryId == docketEntryId
       );
-
-      // Embed the pacer_doc_id as a data attribute within the anchor tag
-      // to facilitate subsequent retrieval based on this identifier.
-      link.dataset.pacerDocId = docketEntryData.docketEntryId;
+      if (!docketEntryData) continue;
 
       // add the id to the array of doc ids
-      docIds.push(docketEntryData.docketEntryId);
+      docIds.push(docketEntryId);
+      for (const doc of docketEntryData.docketEntryDocuments) {
+        docsToEntries[doc.docketDocumentDetailsId] = docketEntryId;
+      }
     }
-
     let clCourt = PACER.convertToCourtListenerCourt(this.court);
     // submit fetch request through background worker
     const recapLinks = await dispatchBackgroundFetch({
@@ -369,7 +457,7 @@ AppellateDelegate.prototype.handleAcmsDocket = async function () {
       let doc_id = result.pacer_doc_id;
       // Query the docket entry link using the data attribute
       // attached previously
-      let anchor = document.querySelector(`[data-pacer-doc-id="${doc_id}"]`);
+      let anchor = document.querySelector(`[data-docket-entry-id="${doc_id}"]`);
       // Create the RECAP icon
       let href = `https://storage.courtlistener.com/${result.filepath_local}`;
       let recap_link = $('<a/>', {
@@ -385,128 +473,221 @@ AppellateDelegate.prototype.handleAcmsDocket = async function () {
         class: 'recap-inline-appellate',
       });
       recap_div.append(recap_link);
-      // Insert the RECAP icon next to the docket entry link
-      recap_div.insertAfter(anchor);
+
+      // Target the table row (<tr>) corresponding to this docket entry
+      let parent_tr = anchor.closest(`tr[data-docket-entry-id="${doc_id}"]`);
+
+      // Within that row, locate the span that contains the document links
+      const parent_span = parent_tr.querySelector("span.document-controls");
+
+      // Append the generated RECAP element to the controls area
+      parent_span.appendChild(recap_div[0]);
+
     }
     let spinner = document.getElementById('recap-button-spinner');
     if (spinner) spinner.classList.add('recap-btn-spinner-hidden');
+    await updateTabStorage({
+      [this.tabId]: {
+        docsToEntries: docsToEntries,
+      },
+    });
   };
 
-  // Since this page uses Vue.js for dynamic data rendering and shows a loader
-  // during API requests, an observer is necessary to monitor DOM changes and
-  // update the component accordingly.
-  const footerObserver = async (mutationList, observer) => {
-    for (const r of mutationList) {
-      // We could restrict this to div#box, but that feels overspecific
-      for (const a of r.addedNodes) {
-        // We use the the footer element as an indicator that the entire page
-        // has finished loading.
-        if (a.localName === 'footer') {
-          if ('caseSummary' in sessionStorage) {
-            processDocket();
-            attachLinkToDocs();
-            insertRecapButton();
-            observer.disconnect();
-          } else {
-            console.log(
-              'We observed a <footer> being added, but no ' +
-                'sessionStorage.caseSummary; this is unexpected.'
-            );
-          }
-        }
-      }
-    }
-  };
-
-  const footer = document.querySelector('footer');
-  // Checks whether the footer is rendered or not, indicating that the page
-  // has fully loaded. Once confirmed, proceed with reloading the RECAP icons.
-  // This check is particularly useful when users click the 'Refresh RECAP
-  // links' option in the RECAP button, because the page is not reloaded and
-  // there are no changes being made to the DOM.
-  if (footer){
-    attachLinkToDocs();
-  } else {
-    const body = document.querySelector('body');
-    const observer = new MutationObserver(footerObserver);
-    observer.observe(body, { subtree: true, childList: true });
-  }
+  await APPELLATE.storeMetaDataInSession();
+  this.pacer_case_id = await getACMSCaseIdFromSession();
+  processDocket();
+  await insertRecapButton();
+  await attachLinkToDocs();
 };
 
 AppellateDelegate.prototype.handleAcmsDownloadPage = async function () {
 
-  async function startUploadProcess() {
-    // This function initiates the upload process for a PDF document.
-    // It performs the following steps:
-    //
-    // 1. Prepares data for upload:
-    //    - Parses download data from session storage and creates a request
-    //      body for the PDF URL document.
-    //
-    // 2. Retrieves configuration and tokens:
-    //    - Extracts API URL and token from session storage stored in
-    //      the 'recapACMSConfiguration' key.
-    //
-    // 3. Extracts document information:
-    //    - Extracts title from the element with class 'p.font-weight-bold'.
-    //    - Parses relevant details (att_number) from the title.
-    //    - Builds a documentData object containing docket number, document
-    //      number, and attachment number.
-    //
-    // 4. Adds a loading message:
-    //    - Creates a loading message using APPELLATE.createsLoadingMessage.
-    //
-    // 5. Stores case ID and document GUID (assumed for later use):
-    //    - Saves case ID from download data.
-    //    - Saves document GUID from download data.
-    //
-    // 6. Gets PDF download URL and initiates download:
-    //    - Stores the current page HTML content.
-    //    - Calls acms.getDocumentURL to get the PDF download URL.
-    //    - Once the URL is retrieved, initiates an HTTP request to download
-    //      the PDF.
-    //    - Binds the handleDocFormResponse function to handle the downloaded
-    //      data and document information after download completes.
-    let downloadData = JSON.parse(
-      sessionStorage.getItem('recapVueData')
+  const isDownloadConfirmationModal = (modal) => {
+    // Checks whether the modal contains a transaction receipt and an
+    // "Accept Charges and Retrieve" button, indicating it's a download
+    // confirmation page we should handle.
+    const text = modal.textContent.toLowerCase();
+    return (
+      text.includes('transaction receipt') &&
+      text.includes('accept charges and retrieve')
     );
+  };
+
+  const resolveDocumentData = () => {
+    // Resolves the specific docket entry and document data associated with
+    // the currently displayed download confirmation modal. It performs the
+    // following steps:
+    // 1. Reads the full `recapDocViewModel` from sessionStorage, which contains
+    //    docketEntries.
+    // 2. Reads the `recapDownloadDocumentData` from sessionStorage, which
+    //    should have been set when the user clicked the document link to
+    //    trigger the download modal.
+    // 3. Finds the specific docket entry in `docketEntries` that matches the
+    //    `docketEntryId` from the download data.
+    // 4. If no matching docket entry or documents are found, returns nulls.
+    // 5. If multiple documents are associated with the docket entry, matches
+    //    on the specific document using `docketDocumentDetailsId`.
+    // 6. Returns an object containing both the matched `docketEntryData` and
+    //    `documentData` for use in subsequent processing.
+    const { docketEntries } = JSON.parse(sessionStorage.recapDocViewModel);
+    const downloadData = JSON.parse(
+      sessionStorage.getItem('recapDownloadDocumentData')
+    );
+
+    const docketEntryData = docketEntries.find(
+      (entry) => entry.docketEntryId == downloadData.docketEntryId
+    );
+
+    if (!docketEntryData?.docketEntryDocuments?.length) {
+      return { docketEntryData: null, documentData: null };
+    }
+
+    // For entries with multiple attachments, match on the specific document
+    // that was clicked. For single-document entries, use the only document.
+    let documentData;
+    if (docketEntryData?.docketEntryDocuments?.length > 1) {
+      documentData = docketEntryData.docketEntryDocuments.find(
+        (doc) =>
+          doc.docketDocumentDetailsId ==
+          downloadData.docketEntryDocuments[0].docketDocumentDetailsId
+      );
+    } else {
+      documentData = docketEntryData.docketEntryDocuments[0];
+    }
+
+    return { docketEntryData, documentData };
+  };
+
+  const insertRecapBannerIfAvailable = async (
+    docketEntryData,
+    documentData
+  ) => {
+    // Queries the RECAP archive for the document and inserts a download
+    // banner if a copy is available.
+    const clCourt = PACER.convertToCourtListenerCourt(this.court);
+
+    const recapLinks = await dispatchBackgroundFetch({
+      action: 'getAvailabilityForDocuments',
+      data: {
+        docket_entry__docket__court: clCourt,
+        pacer_doc_id__in: docketEntryData.docketEntryId,
+      },
+    });
+
+    if (!recapLinks?.results?.length) {
+      console.error('RECAP: Failed getting availability for dockets.');
+      return;
+    }
+
+    console.info(
+      'RECAP: Got results from API. Processing results to insert banner'
+    );
+
+    const result = recapLinks.results.find(
+      (obj) => obj.acms_document_guid === documentData.docketDocumentDetailsId
+    );
+    if (!result) return;
+
+    // Create a centered wrapper div to hold the RECAP banner
+    const wrapper = document.createElement('div');
+    wrapper.style.display = 'flex';
+    wrapper.style.justifyContent = 'center';
+
+    const target = document.querySelector(
+      '.modal-scrollable-content div.text-center'
+    );
+    if (!target) return;
+    target.appendChild(wrapper);
+
+    // Insert the banner inside the centered wrapper
+    insertAvailableDocBanner(result.filepath_local, wrapper);
+  };
+
+  async function startUploadProcess() {
+    // This function initiates the upload process for a PDF document
+    // from the ACMS download confirmation modal. It performs the
+    // following steps:
+    //
+    // 1. Retrieves configuration and tokens:
+    //    - Parses the recapDocViewModel from sessionStorage to extract
+    //      the API URL, case number, auth token, and case summary.
+    //
+    // 2. Prepares data for upload:
+    //    - Parses download data from sessionStorage and creates a
+    //      request body for the PDF merge API.
+    //
+    // 3. Builds document summary:
+    //    - Creates a documentSummary object containing the docket
+    //      number, document number, and attachment number (if the
+    //      docket entry has multiple documents).
+    //
+    // 4. Displays a loading message:
+    //    - Clears the modal body and inserts a loading indicator
+    //      using APPELLATE.createsLoadingMessage.
+    //
+    // 5. Stores case ID and document GUID for later use:
+    //    - Saves the pacer_case_id from the case summary.
+    //    - Saves the ACMS document GUID from the document data.
+    //
+    // 6. Fetches and downloads the PDF:
+    //    - Captures the current HTML for later restoration.
+    //    - Calls APPELLATE.fetchAcmsDocumentUrl to get the download
+    //      URL from the merge API.
+    //    - Fetches the PDF as a blob from that URL.
+    //    - Passes the blob to handleDocFormResponse for RECAP upload
+    //      and display.
+    let {
+      baseApiUrl,
+      caseNumber,
+      docketEntries,
+      authTokenResult,
+      caseSummaryHeadingViewModel,
+    } = JSON.parse(sessionStorage.recapDocViewModel);
+
+    let downloadData = JSON.parse(
+      sessionStorage.getItem('recapDownloadDocumentData')
+    );
+    let docketEntryData = docketEntries.find(
+      (entry) => entry.docketEntryId == downloadData.docketEntryId
+    );
+
+    if (!docketEntryData?.docketEntryDocuments?.length) return;
+
     const pdfFileRequestBody =
       APPELLATE.createAcmsDocumentRequestBody(downloadData);
 
-    // Get the ACMS API URL and token from the sessionStorage object
-    let appConfiguration = JSON.parse(
-      sessionStorage.getItem('recapACMSConfiguration')
-    );
-    let { ApiUrl } = appConfiguration.AppSettings;
-    let { Token } = appConfiguration.AuthToken;
+    let docData = null;
+    if (docketEntryData?.docketEntryDocuments?.length > 1) {
+      docData = docketEntryData.docketEntryDocuments.find(
+        (doc) =>
+          doc.docketDocumentDetailsId ==
+          downloadData.docketEntryDocuments[0].docketDocumentDetailsId
+      );
+    } else {
+      docData = docketEntryData.docketEntryDocuments[0];
+    }
 
-    // Collect relevant document information to upload PDF to CL
-    let title = document.querySelector('p.font-weight-bold').innerHTML.trim();
-    let dataFromTitle = APPELLATE.parseReceiptPageTitle(title);
-    let documentData = {
-      docket_number: downloadData.caseSummary.caseDetails.caseNumber,
-      doc_number: downloadData.docketEntry.entryNumber,
+    let documentSummary = {
+      docket_number: caseNumber,
+      doc_number: docketEntryData.entryNumber,
       att_number:
-        downloadData.docketEntry.documentCount > 1
-          ? dataFromTitle.att_number
-          : null,
+        docketEntryData.documentCount > 1 ? docData.documentNumber : null,
     };
 
     // Remove element from the page to show loading message
-    let mainDiv = document.querySelector('.download-confirmation-wrapper');
+    let mainDiv = modal.querySelector('.modal-body');
     mainDiv.innerHTML = '';
-    loadingTextMessage = APPELLATE.createsLoadingMessage(downloadData);
+    let loadingTextMessage = APPELLATE.createsLoadingMessage(caseNumber);
     mainDiv.append(loadingTextMessage);
 
     // Get the pacer_case_id and document GUID from the sessionStorage object
-    this.pacer_case_id = downloadData.caseSummary.caseDetails.caseId;
-    this.acmsDocumentGuid =
-      downloadData.docketEntryDocuments[0].docketDocumentDetailsId;
+    this.pacer_case_id = caseSummaryHeadingViewModel.caseId;
+    this.acmsDocumentGuid = docData.docketDocumentDetailsId;
 
     let previousPageHtml = document.documentElement.innerHTML;
     let pdf_url = await APPELLATE.fetchAcmsDocumentUrl({
-      apiUrl: ApiUrl,
-      token: Token,
+      apiUrl: baseApiUrl,
+      token: authTokenResult.token,
       mergePdfFilesRequest: pdfFileRequestBody,
     });
     const resp = await window.fetch(pdf_url, { method: 'GET' });
@@ -516,118 +697,69 @@ AppellateDelegate.prototype.handleAcmsDownloadPage = async function () {
       await resp.blob(),
       null,
       previousPageHtml,
-      documentData
+      documentSummary
     );
   }
 
-  const wrapperMutationObserver = async (mutationList, observer) => {
-    for (const r of mutationList) {
-      for (const n of r.addedNodes) {
-        let hasReceipt = n.textContent
-          .toLowerCase()
-          .includes('transaction receipt');
+  const replaceAcceptChargesButton = (modal) => {
+    // Removes the original "Accept Charges and Retrieve" button and replaces
+    // it with a RECAP button that intercepts the download flow.
+    //
+    // The original button's event handler fetches a one-time-use PDF URL and
+    // navigates to it directly. We need to replace it so we can fetch the PDF
+    // as a blob, upload it to the RECAP archive, and then display it.
+    const acceptChargesButton = modal.querySelector(
+      '.modal-fixed-footer button'
+    );
+    if (!acceptChargesButton) return;
 
-        let hasAcceptChargesButton = n.textContent
-          .toLowerCase()
-          .includes('accept charges and retrieve');
+    const parentElement = acceptChargesButton.parentNode;
+    acceptChargesButton.remove();
 
-        // The `selectedDocuments` key in sessionStorage is only available when
-        // the download page is loaded from an attachment page. It is not
-        // available when loaded from a case summary entry. This check ensures
-        // the extension can handle both scenarios gracefully.
-        let hasOneDocument = true;
-        if (sessionStorage.getItem('selectedDocuments')) {
-          hasOneDocument =
-            JSON.parse(sessionStorage.selectedDocuments).length == 1;
-        }
+    const newButton = document.createElement('input');
+    newButton.type = 'submit';
+    newButton.value = 'Accept Charges and RECAP Document';
+    newButton.classList.add('btn', 'btn-light', 'btn-outline-dark');
+    parentElement.appendChild(newButton);
 
-        if (
-          n.localName === 'div' &&
-          hasReceipt &&
-          hasAcceptChargesButton
-        ) {
-          if (!hasOneDocument) {
-            pdfWarning = combinedPdfWarning();
-            n.append(pdfWarning);
-            return;
-          }
-
-          // Insert script to retrieve and store Vue data in the storage
-          await APPELLATE.storeVueDataInSession();
-
-          // Get doc_id from the sessionStorage
-          let downloadData = JSON.parse(sessionStorage.getItem('recapVueData'));
-          this.docId = downloadData.docketEntry.docketEntryId;
-
-          // Check if the accept charges button is already created on the page
-          let acceptChargesButton = document.querySelector('button');
-          if (!acceptChargesButton) {
-            return;
-          }
-
-          // Clone the "Accept charges" button to remove the onclick event.
-          // The default event handler retrieves an URL for the PDF and then
-          // navigate to this page, but if we wait until the handler finishes,
-          // we wont be able to use the same link to get the doc as a blob
-          // object because the URL seems to be a one-time-use link and
-          // attempting to access it after the handler has used it will result
-          // in an error message stating that the file retrieval attempt failed.
-          let clonedAcceptChargesButton = acceptChargesButton.cloneNode(true);
-          acceptChargesButton.replaceWith(clonedAcceptChargesButton);
-
-          // Add a custom onclick event to the Accept charges button.
-          // The handler of this new event performs an additional task before
-          // displaying the document. Upon clicking the button, the document
-          // retrieval process will remain unchanged, but the retrieved blob
-          // object will be uploaded to the RECAP archive before the document
-          // is rendered on the page.
-          clonedAcceptChargesButton.addEventListener(
-            'click',
-            startUploadProcess.bind(this)
-          );
-
-          // Query the server to check the availability of the document in the
-          // RECAP archive.
-          let clCourt = PACER.convertToCourtListenerCourt(this.court);
-          const recapLinks = await dispatchBackgroundFetch({
-            action: 'getAvailabilityForDocuments',
-            data: {
-              docket_entry__docket__court: clCourt,
-              pacer_doc_id__in: this.docId,
-            },
-          });
-          // return if there are no results
-          if (!recapLinks)
-            return console.error(
-              'RECAP: Failed getting availability for dockets.'
-            );
-
-          console.info(
-            'RECAP: Got results from API. Processing results to insert banner'
-          );
-          // To accurately identify ACMS documents, we should prioritize the
-          // `ACMS document details ID` stored in browser sessionStorage over
-          // the docket entry ID. This is because ACMS often uses the same URL
-          // for different attachments, making it ambiguous for identification
-          // purposes.
-          let acms_doc_id =
-            downloadData.docketEntryDocuments[0].docketDocumentDetailsId;
-          let result = recapLinks.results.filter(
-            (obj) => obj.acms_document_guid == acms_doc_id,
-            this
-          )[0];
-          if (!result) return;
-          insertAvailableDocBanner(result.filepath_local, 'div.box');
-        }
-      };
-    };
+    newButton.addEventListener(
+      'click',
+      startUploadProcess.bind(this)
+    );
   };
 
-  const wrapper = document.getElementsByClassName(
-    'download-confirmation-wrapper'
-  )[0];
-  const observer = new MutationObserver(wrapperMutationObserver);
-  observer.observe(wrapper, { subtree: true, childList: true });
+  await APPELLATE.storeDocumentDataFromDownloadModal();
+  const modal = document.getElementById('document-viewer-modal');
+
+  // Only proceed if this is a billable download confirmation page
+  // with the "Accept Charges" button present.
+  if (!isDownloadConfirmationModal(modal)) return;
+
+  // We only handle single-document downloads. For combined/multi-document
+  // downloads, show a warning banner and exit.
+  const transactionReceipts = modal.querySelectorAll('.transaction-receipt');
+  if (transactionReceipts.length !== 1) {
+    const modalTitle = modal.querySelector('div.text-center');
+    modalTitle.appendChild(combinedPdfWarning());
+    return;
+  }
+
+  // Resolve the specific docket entry and document that triggered the modal,
+  // using the docketEntryId stored in sessionStorage by the injected script.
+  const { docketEntryData, documentData } = resolveDocumentData();
+  if (!docketEntryData || !documentData) return;
+
+  this.docId = docketEntryData.docketEntryId;
+
+  // Replace the default "Accept Charges" button with our own that intercepts
+  // the download. The original button's handler fetches a one-time-use PDF URL
+  // and navigates to it. We need to intercept before that happens so we can
+  // download the PDF as a blob for RECAP upload.
+  replaceAcceptChargesButton(modal);
+
+  // Check the RECAP archive for an existing copy of this document
+  // and display a banner if one is available.
+  await insertRecapBannerIfAvailable(docketEntryData, documentData);
 };
 
 AppellateDelegate.prototype.handleCaseSearchPage = () => {

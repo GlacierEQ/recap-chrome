@@ -8,8 +8,9 @@ import {
   chooseVariant,
   injectContentScript,
   showNotificationTab,
-  getAndStoreVueData,
+  getAndStoreMetaData,
   overwriteSubmitMethod,
+  getDocumentDataFromDownloadModal,
 } from './utils/background.js';
 import { handleBackgroundFetch } from './utils/background_fetch.js';
 import { handleBackgroundNotification } from './utils/background_notifier.js';
@@ -33,8 +34,12 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
     handleBackgroundNotification(msg, sender, sendResponse);
     return true;
   }
-  if (msg.message === 'getVueData') {
-    getAndStoreVueData(msg, sender, sendResponse);
+  if (msg.message === 'getMetaData') {
+    getAndStoreMetaData(msg, sender, sendResponse);
+    return true;
+  }
+  if (msg.message === 'getDocumentDataFromDownloadModal') {
+    getDocumentDataFromDownloadModal(msg, sender, sendResponse);
     return true;
   }
   if (msg.message === 'overwriteSubmit') {

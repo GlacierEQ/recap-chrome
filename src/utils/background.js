@@ -106,32 +106,80 @@ export function showNotificationTab(details) {
     chrome.tabs.create({
       url: 'https://free.law/fundraiser/2024/recap',
     });
+  } else if (details.reason === 'update' && currentVersion === '2.8.6') {
+    chrome.tabs.create({
+      url: 'https://free.law/fundraiser/recap',
+    });
   }
 }
 
-export function getAndStoreVueData(req, sender, sendResponse) {
-  const getVueDiv = () => {
-    // The following code draws inspiration from the Vue devtool extension
-    // to identify and inspect Vue components within a web application.
-    // Unlike the devtool extension, which explores the entire DOM, this script
-    // focuses on extracting the data of the main Vue component. By tailoring
-    // the script to the component's HTML structure, we achieve a quick data
-    // retrieval process compared to a full DOM exploration.
-    // The extracted data is then stored in session storage for later use.
-    let contentWrapper = document.getElementsByClassName('text-center')[0];
-    let vueMainDiv = contentWrapper.parentElement;
-    let vueDataProperties = vueMainDiv.__vue__._data;
-    sessionStorage.setItem('recapVueData', JSON.stringify(vueDataProperties));
+export function getAndStoreMetaData(req, sender, sendResponse) {
+  const getViewMetaData = () => {
+    // The ACMS site exposes a data object (`window.showDocViewModel`) on the
+    // global scope. Rather than traversing the DOM or inspecting framework
+    // internals, we read directly from this object to efficiently capture the
+    // data needed for RECAP.
     sessionStorage.setItem(
-      'recapACMSConfiguration',
-      JSON.stringify(window._model)
+      'recapDocViewModel',
+      JSON.stringify(window.showDocViewModel)
     );
     return true;
   };
   chrome.scripting
     .executeScript({
       target: { tabId: sender.tab.id },
-      func: getVueDiv,
+      func: getViewMetaData,
+      world: executionWorld,
+    })
+    .then((injectionResults) => sendResponse(injectionResults));
+}
+
+export function getDocumentDataFromDownloadModal(req, sender, sendResponse) {
+  const getDocumentData = () => {
+    try {
+      // Access the DownloadConfirmation instance via the global
+      // ShowDocPageInitializer -> DocumentModalManager -> currentComponent.
+      // chain currentComponent holds the DownloadConfirmation object that was
+      // created when the user clicked a document link in the docket.
+      const component =
+        window.showDocPageInitializer.modalManager.currentComponent;
+
+      const detail = {
+        // The docket entry ID that triggered the modal. This is the unique
+        // identifier (GUID) from the clicked link's data-docket-entry-id
+        // attribute.
+        docketEntryId: component.docketEntryId || null,
+        // The full array of document objects associated with this download.
+        // Each object contains properties like name, documentUrl,
+        // docketDocumentDetailsId, pageCount, billablePages, cost, etc.
+        docketEntryDocuments: component.docketEntryDocuments,
+      };
+
+      // Store the result in sessionStorage so it can be read back by
+      // the content scripts. Using sessionStorage as a bridge between
+      // the page context and the extension context.
+      sessionStorage.setItem(
+        'recapDownloadDocumentData',
+        JSON.stringify(detail)
+      );
+    } catch (e) {
+      // If the modal isn't open or the component chain is unavailable,
+      // store an error result instead.
+      sessionStorage.setItem(
+        'recapDownloadDocumentData',
+        JSON.stringify({
+          docketEntryId: null,
+          docketEntryDocuments: [],
+          error: e.message,
+        })
+      );
+    }
+    return true;
+  };
+  chrome.scripting
+    .executeScript({
+      target: { tabId: sender.tab.id },
+      func: getDocumentData,
       world: executionWorld,
     })
     .then((injectionResults) => sendResponse(injectionResults));
